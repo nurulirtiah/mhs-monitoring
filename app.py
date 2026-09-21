@@ -441,38 +441,83 @@ CLASS_INFO = {
 
 
 # =====================================================================
-# Fallback pemetaan dari kode channel LAMA (kolom teks "Channel" di LBP,
-# format "111-RT - RETAIL SMALL" dsb) ke KODE CLASS baru (1-13).
-# HANYA dipakai kalau kolom "CLASS" tidak ada di file LBP yang diupload.
-# Sengaja TIDAK diisi untuk kode yang ambigu (satu kode channel lama bisa
-# mencakup beberapa class baru, mis. '110' bisa Grosir Modern/Minimarket/
-# Supermarket sekaligus) — lebih baik toko tsb ditandai "tidak bisa
-# diklasifikasikan" daripada dihitung dengan target yang salah.
+# CLASS RESOLUTION / FALLBACK
+# Urutan prioritas: (1) CLASS valid di baris LBP, (2) CLASS valid lain
+# pada outlet yang sama, (3) fallback CHANNEL hanya untuk channel yang
+# memang 1:1 ke CLASS. Nilai seperti #N/A, ZZ, kosong, atau kode di luar
+# 1-13 dianggap tidak valid. Kita TIDAK menebak class untuk channel yang
+# ambigu.
 # =====================================================================
+VALID_CLASS_CODES = set(CLASS_INFO.keys())
 FALLBACK_CHANNEL_PREFIX_TO_CLASS = {
-    '111': 5,   # Kios -> 1:1
-    '113': 4,   # Retail Large -> 1:1
-    # 118 = Kantin (class 8/9/10) -> ambigu
-    # 154 = Warduh (class 11/12/13) -> ambigu
-    # 105/109/110 = Modern Trade (class 6/7) -> ambigu
-    # 114/115/116 = Grosir (class 1/2/3) -> ambigu
-    # Jangan menebak class jika channel lama mencakup >1 class.
+    '111': 5,   # Retail Small / Kios
+    '113': 4,   # Retail Large
 }
 
+EXCLUDED_CHANNEL_KEYWORDS = (
+    'MUH',              # Mayora United Home / EO MUH
+    'ANEKA PEMBELI',   # bukan scope MHS AGT
+)
 
-def get_outlet_class_code(row):
-    """Tentukan kode class (1-13) sebuah baris transaksi.
-    Prioritas: kolom 'CLASS' asli dari LBP (paling akurat, sesuai
-    'KODE CLASS PER 08.09.26' di Daftar Master Pelanggan). Kalau kolom
-    itu tidak ada / kosong, coba dekati dari 3 digit awal kolom 'Channel'
-    (hanya untuk kode yang tidak ambigu)."""
-    if 'CLASS' in row and pd.notna(row['CLASS']):
-        try:
-            return int(row['CLASS'])
-        except (ValueError, TypeError):
-            pass
-    ch_prefix = str(row.get('Channel', ''))[:3]
-    return FALLBACK_CHANNEL_PREFIX_TO_CLASS.get(ch_prefix, None)
+
+def normalize_class(value):
+    """Ubah CLASS menjadi kode 1-13. Nilai lain dianggap invalid."""
+    if pd.isna(value):
+        return None
+    text = str(value).strip().upper()
+    if text in {'', '#N/A', 'N/A', 'NA', 'NAN', 'NONE', 'NULL', 'ZZ'}:
+        return None
+    try:
+        code = int(float(text))
+    except (ValueError, TypeError):
+        return None
+    return code if code in VALID_CLASS_CODES else None
+
+
+def channel_prefix(channel):
+    text = str(channel).strip()
+    return text[:3] if text else ''
+
+
+def is_excluded_mhs_channel(channel):
+    """TRUE bila channel berada di luar scope MHS AGT (MUH / Aneka Pembeli)."""
+    text = str(channel).strip().upper()
+    return any(keyword in text for keyword in EXCLUDED_CHANNEL_KEYWORDS)
+
+
+def resolve_class_codes(df):
+    """Resolve CLASS secara bertingkat dan mengembalikan (class, source).
+
+    1. CLASS valid pada baris itu sendiri.
+    2. Bila invalid, gunakan CLASS valid yang ditemukan pada outlet yang sama,
+       tetapi hanya bila outlet tersebut punya tepat satu CLASS valid.
+    3. Bila masih kosong, gunakan mapping CHANNEL 1:1 yang aman.
+    4. Selain itu tetap None agar tidak terjadi salah klasifikasi.
+    """
+    result = pd.Series([None] * len(df), index=df.index, dtype='object')
+    source = pd.Series(['UNCLASSIFIED'] * len(df), index=df.index, dtype='object')
+
+    direct = df['CLASS'].apply(normalize_class) if 'CLASS' in df.columns else pd.Series([None]*len(df), index=df.index)
+    result.loc[direct.notna()] = direct.loc[direct.notna()]
+    source.loc[direct.notna()] = 'DIRECT_LBP'
+
+    # Fallback 1: class valid lain pada outlet yang sama.
+    tmp = pd.DataFrame({'outlet': df['No Outlet'], 'direct': direct})
+    outlet_valid = tmp[tmp['direct'].notna()].groupby('outlet')['direct'].agg(lambda s: sorted(set(int(x) for x in s)))
+    for outlet, classes in outlet_valid.items():
+        if len(classes) == 1:
+            mask = (df['No Outlet'] == outlet) & result.isna()
+            result.loc[mask] = classes[0]
+            source.loc[mask] = 'OUTLET_FALLBACK'
+
+    # Fallback 2: channel yang benar-benar 1:1.
+    unresolved = result.isna()
+    channel_map = df['Channel'].apply(lambda x: FALLBACK_CHANNEL_PREFIX_TO_CLASS.get(channel_prefix(x)))
+    mask = unresolved & channel_map.notna()
+    result.loc[mask] = channel_map.loc[mask]
+    source.loc[mask] = 'CHANNEL_FALLBACK'
+
+    return result, source
 
 
 def cek_sku_valid(pcode, class_code):
@@ -519,9 +564,7 @@ def convert_df_to_excel(df_dict):
 
 # Parser LBP
 def parse_raw_lbp(uploaded_file):
-    """Baca LBP langsung atau workbook Mayora. Untuk XLSX, otomatis pilih sheet LBP bila ada."""
-    name = uploaded_file.name.lower()
-    if name.endswith(('.txt', '.csv')):
+    if uploaded_file.name.endswith(('.txt', '.csv')):
         raw_bytes = uploaded_file.read()
         lines = raw_bytes.decode('utf-8', errors='ignore').splitlines()
         cleaned_lines = []
@@ -532,14 +575,13 @@ def parse_raw_lbp(uploaded_file):
             if line_str.endswith('|'):
                 line_str = line_str[:-1]
             cleaned_lines.append(line_str)
+
         first_line = cleaned_lines[0] if cleaned_lines else ""
         sep = '|' if '|' in first_line else ('\t' if '\t' in first_line else (';' if ';' in first_line else ','))
         df = pd.read_csv(io.StringIO('\n'.join(cleaned_lines)), sep=sep, low_memory=False)
     else:
-        # Excel workbook: gunakan sheet LBP jika tersedia; kalau tidak, gunakan sheet pertama.
-        xls = pd.ExcelFile(uploaded_file)
-        sheet = next((s for s in xls.sheet_names if str(s).strip().upper() == 'LBP'), xls.sheet_names[0])
-        df = pd.read_excel(xls, sheet_name=sheet)
+        df = pd.read_excel(uploaded_file)
+
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
@@ -555,16 +597,14 @@ cb_standpro = st.sidebar.number_input(
     help="Target Base Customer (CB) Standpro area untuk menghitung % pencapaian dan tier insentif."
 )
 
-uploaded_lbp = st.sidebar.file_uploader("📂 Upload File LBP / Workbook (.txt / .csv / .xlsx)", type=['txt', 'csv', 'xlsx'])
-st.sidebar.caption("💡 Upload LBP .xlsx/.csv/.txt. Jika upload workbook Excel Mayora yang berisi sheet LBP, app otomatis membaca sheet **LBP**. Kolom CLASS 1-13 dipakai sebagai klasifikasi resmi.")
+uploaded_lbp = st.sidebar.file_uploader("📂 Upload File LBP (.txt / .csv / .xlsx)", type=['txt', 'csv', 'xlsx'])
+st.sidebar.caption("💡 Untuk hasil paling akurat, pastikan file LBP menyertakan kolom **CLASS** (kode 1-13 sesuai 'KODE CLASS PER 08.09.26'). Tanpa kolom ini, sebagian toko (channel 110/114/115) tidak bisa dihitung MHS-nya secara otomatis.")
 
 # --- PEMROSESAN DATA & DASHBOARD ---
 if uploaded_lbp is not None:
     try:
         with st.spinner("Memproses data LBP & memetakan SKU sesuai Must Have SKU resmi..."):
             df_raw = parse_raw_lbp(uploaded_lbp)
-
-            st.caption('ℹ️ Mesin menghitung MHS secara DISTINCT berdasarkan MHS_KEY setelah Net Qty per PCode menjadi positif. PCode yang tidak eligible untuk CLASS outlet tidak dihitung.')
 
             df_raw['Salesman'] = df_raw['Salesman'].astype(str).str.strip()
             df_raw['Pcode_Str'] = df_raw['Pcode'].astype(str).str.strip()
@@ -587,7 +627,8 @@ if uploaded_lbp is not None:
             if not has_class_col:
                 df_raw['CLASS'] = pd.NA
 
-            df_raw['Class_Code'] = df_raw.apply(get_outlet_class_code, axis=1)
+            df_raw['MHS_EXCLUDED'] = df_raw['Channel'].apply(is_excluded_mhs_channel)
+            df_raw['Class_Code'], df_raw['Class_Source'] = resolve_class_codes(df_raw)
 
             is_retur = df_raw['TRANSTYPE'].astype(str).str.strip().str.upper() == 'R'
             df_raw['NET_QTY'] = df_raw['QTYPCS'].where(~is_retur, -df_raw['QTYPCS'])
@@ -598,16 +639,23 @@ if uploaded_lbp is not None:
             all_salesmen = sorted(df_raw['Salesman'].dropna().unique().tolist())
 
         if not has_class_col:
-            st.markdown("""<div class="warn-card">⚠️ <b>Kolom CLASS tidak ditemukan</b> di file LBP yang diupload.
-            Klasifikasi toko untuk channel 110 (Grosir Modern/Minimarket/Supermarket), 114 dan 115
-            (Grosir Kelontong/Snack) <b>tidak bisa ditentukan otomatis</b> dan toko-toko tsb akan
-            ditandai "Tidak Terklasifikasi" (tidak dihitung MHS-nya). Sertakan kolom CLASS (kode 1-13
-            sesuai "KODE CLASS PER 08.09.26" di Daftar Master Pelanggan) di export LBP untuk hasil yang akurat.</div>""", unsafe_allow_html=True)
+            st.markdown("""<div class="warn-card">⚠️ <b>Kolom CLASS tidak ditemukan</b>. App akan mencoba fallback berurutan:
+            CLASS valid → CLASS valid lain pada outlet yang sama → mapping CHANNEL 1:1.
+            Channel yang ambigu tidak ditebak agar target MHS tidak salah.</div>""", unsafe_allow_html=True)
 
-        n_unclassified = int(df_raw['Class_Code'].isna().sum())
+        excluded_count = int(df_raw['MHS_EXCLUDED'].sum())
+        if excluded_count > 0:
+            st.markdown(f"""<div class="warn-card">ℹ️ {excluded_count:,} baris transaksi dari <b>MUH / Aneka Pembeli</b> berada di luar scope MHS dan tidak ikut perhitungan.</div>""", unsafe_allow_html=True)
+
+        in_scope_mask = ~df_raw['MHS_EXCLUDED']
+        n_unclassified = int(df_raw.loc[in_scope_mask, 'Class_Code'].isna().sum())
         if n_unclassified > 0:
-            st.markdown(f"""<div class="warn-card">ℹ️ {n_unclassified:,} baris transaksi berasal dari toko yang
-            kode class-nya tidak bisa ditentukan, dan dikeluarkan dari perhitungan MHS.</div>""", unsafe_allow_html=True)
+            st.markdown(f"""<div class="warn-card">ℹ️ {n_unclassified:,} baris transaksi dalam scope MHS tetap belum dapat CLASS setelah fallback dan tidak dihitung.</div>""", unsafe_allow_html=True)
+
+        fallback_count = int((df_raw['Class_Source'] == 'OUTLET_FALLBACK').sum())
+        channel_fallback_count = int((df_raw['Class_Source'] == 'CHANNEL_FALLBACK').sum())
+        if fallback_count or channel_fallback_count:
+            st.info(f"Fallback CLASS berhasil: {fallback_count:,} baris dari CLASS outlet yang sama + {channel_fallback_count:,} baris dari mapping CHANNEL 1:1.")
 
         with st.sidebar:
             st.markdown("---")
@@ -624,10 +672,11 @@ if uploaded_lbp is not None:
             st.stop()
 
         df = df_raw[df_raw['Salesman'].isin(selected_salesmen)].copy()
+        df_mhs = df[~df['MHS_EXCLUDED']].copy()
 
-        base_cols = ['No Outlet', 'Nama Outlet', 'Kode Sales', 'Salesman', 'Channel', 'Salesforce', 'Kabupaten', 'Kecamatan', 'Kode Pasar', 'Class_Code']
-        cols_exist = [c for c in base_cols if c in df.columns]
-        outlet_master = df[cols_exist].drop_duplicates(subset=['No Outlet']).copy()
+        base_cols = ['No Outlet', 'Nama Outlet', 'Kode Sales', 'Salesman', 'Channel', 'Salesforce', 'Kabupaten', 'Kecamatan', 'Kode Pasar', 'Class_Code', 'Class_Source']
+        cols_exist = [c for c in base_cols if c in df_mhs.columns]
+        outlet_master = df_mhs[cols_exist].drop_duplicates(subset=['No Outlet']).copy()
         outlet_master['Kelas Toko'] = outlet_master['Class_Code'].apply(get_class_name)
 
         # 1) Net QTY per (outlet, PCode). Retur mengurangi penjualan.
@@ -636,7 +685,7 @@ if uploaded_lbp is not None:
         # 4) Validasi PCode terhadap CLASS outlet.
         # 5) Hitung DISTINCT MHS_KEY per outlet — BUKAN jumlah PCode/varian.
         outlet_prod_agg = (
-            df.groupby(['No Outlet', 'Pcode_Str'])['NET_QTY']
+            df_mhs.groupby(['No Outlet', 'Pcode_Str'])['NET_QTY']
               .sum()
               .reset_index()
         )
